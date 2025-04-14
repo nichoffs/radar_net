@@ -7,8 +7,7 @@ from collections import defaultdict, deque, namedtuple
 
 import cv2
 import numpy as np
-from input import preprocess_input
-from output import preprocess_bounding_boxes, preprocess_velocities
+from input import preprocess_per_vehicle
 from reader import RosBagReader
 from tqdm import tqdm
 
@@ -26,24 +25,23 @@ RadarData = namedtuple("RadarData", ["msg", "sensor_type"])
 vehicle_odom_pattern = re.compile(r"^/vehicle_(\d+)/odometry$")
 
 
-def save_frame_data(
-    frame_id, bounding_boxes, radar_grid, points, velocities, output_dirs
-):
-    image_dir, bbox_dir, velocity_dir = (
-        output_dirs["image"],
-        output_dirs["bbox"],
-        output_dirs["velocity"],
-    )
+def save_frame_data(frame_id, radar_grid, vehicle_data, output_dirs):
+    image_dir = output_dirs["image"]
+    bbox_dir = output_dirs["bbox"]
+    velocity_dir = output_dirs["velocity"]
 
-    radar_grid_uint8 = (radar_grid * 255.0).astype(np.uint8)
-    cv2.imwrite(os.path.join(image_dir, f"{frame_id}.png"), radar_grid_uint8)
+    img_path = os.path.join(image_dir, f"{frame_id}.png")
+    cv2.imwrite(img_path, (radar_grid * 255).astype(np.uint8))
 
-    velocity_save_data = {}
+    velocity_dict = {}
+    bbox_path = os.path.join(bbox_dir, f"{frame_id}.txt")
+    with open(bbox_path, "w") as f:
+        for vid, data in vehicle_data.items():
+            box = data["box"]
+            points = data["points"]
+            velocity = data["velocity"]
 
-    with open(os.path.join(bbox_dir, f"{frame_id}.txt"), "w") as bbox_file:
-        for vehicle_id, box in bounding_boxes:
-            distances = np.linalg.norm(box, axis=-1).reshape(-1)
-            if not np.any(distances < 100):
+            if len(points) <= 5:
                 continue
 
             norm_box = normalize(box)
@@ -51,35 +49,25 @@ def save_frame_data(
                 continue
 
             line = f"0 {' '.join(map(str, norm_box.reshape(-1)))}\n"
-            bbox_file.write(line)
+            f.write(line)
 
-            if len(points[vehicle_id]) > 5:
-                velocity_save_data[vehicle_id] = {
-                    "points": points[vehicle_id],
-                    "velocity": velocities[vehicle_id],
-                }
+            velocity_dict[vid] = {"points": points, "velocity": velocity}
 
-    if velocity_save_data:
+    if velocity_dict:
         np.save(
             os.path.join(velocity_dir, f"{frame_id}.npy"),
-            velocity_save_data,
+            velocity_dict,
             allow_pickle=True,
         )
 
 
-def add_opponent_to_history(
-    history, vehicle_id, timestamp, pose, threshold, vel_x, vel_y
+def update_latest_opponent(history, vehicle_id, timestamp, pose, vel_x, vel_y):
+    history[vehicle_id] = (timestamp, pose, vel_x, vel_y)
+
+
+def trim_expired_radar(
+    radar_window, radar_counts, current_time, window_duration=RADAR_WINDOW_DURATION
 ):
-    if vehicle_id not in history:
-        history[vehicle_id] = deque()
-    history[vehicle_id].append((timestamp, pose, vel_x, vel_y))
-    while history[vehicle_id] and history[vehicle_id][0][0] < timestamp - threshold:
-        history[vehicle_id].popleft()
-    if not history[vehicle_id]:
-        del history[vehicle_id]
-
-
-def trim_radar_window(radar_window, current_time, window_duration, radar_counts):
     while (
         radar_window
         and timestamp_to_sec(radar_window[0].msg) < current_time - window_duration
@@ -96,73 +84,69 @@ def normalize(corners, grid_size=800, meter_range=200):
 
 def sync_opponents_to_ego(opponent_history, ego_time):
     synced = {}
-    for vehicle_id, history in opponent_history.items():
-        for ts, pose, velocity_x, velocity_y in reversed(history):
-            if abs(ego_time - ts) <= SYNC_THRESHOLD:
-                synced[vehicle_id] = (pose, velocity_x, velocity_y)
-                break
-            elif ts < ego_time - SYNC_THRESHOLD:
-                break
+    for vehicle_id, (ts, pose, velocity_x, velocity_y) in opponent_history.items():
+        if abs(ego_time - ts) <= SYNC_THRESHOLD:
+            synced[vehicle_id] = (pose, velocity_x, velocity_y)
     return synced
 
 
-def process_message(
-    topic,
-    msg,
-    time_sec,
-    radar_window,
-    radar_counts,
-    opponent_history,
-    frame_id,
-    output_dirs,
-):
-    if "radar" in topic:
-        sensor = RADAR_TOPIC_TO_SENSOR.get(topic, "unknown")
-        radar_window.append(RadarData(msg=msg, sensor_type=sensor))
-        radar_counts[sensor] += 1
-        trim_radar_window(radar_window, time_sec, RADAR_WINDOW_DURATION, radar_counts)
+def handle_radar_message(topic, msg, time_sec, radar_window, radar_counts):
+    sensor = RADAR_TOPIC_TO_SENSOR[topic]
+    radar_window.append(RadarData(msg=msg, sensor_type=sensor))
+    radar_counts[sensor] += 1
 
-    elif vehicle_odom_pattern.match(topic):
-        vehicle_id = vehicle_odom_pattern.match(topic).group(1)
-        add_opponent_to_history(
+
+def handle_opponent_odometry(topic, msg, time_sec, opponent_history):
+    match = vehicle_odom_pattern.match(topic)
+    if match:
+        vehicle_id = match.group(1)
+        update_latest_opponent(
             opponent_history,
             vehicle_id,
             time_sec,
             msg.pose.pose,
-            SYNC_THRESHOLD,
             msg.twist.twist.linear.x,
             msg.twist.twist.linear.y,
         )
 
+
+def handle_ego_odometry(
+    msg, time_sec, radar_window, radar_counts, opponent_history, frame_id, output_dirs
+):
+    trim_expired_radar(radar_window, radar_counts, time_sec)
+
+    if not (radar_counts.get("front", 0) or radar_counts.get("rear", 0)):
+        return frame_id
+
+    synced_opponents = sync_opponents_to_ego(opponent_history, time_sec)
+    if not (radar_window and synced_opponents):
+        return frame_id
+
+    ego_velocity = np.array([msg.twist.twist.linear.x, msg.twist.twist.linear.y])
+    radar_grid, vehicle_data = preprocess_per_vehicle(
+        msg.pose.pose, ego_velocity, synced_opponents, radar_window
+    )
+    save_frame_data(frame_id, radar_grid, vehicle_data, output_dirs)
+    return frame_id + 1
+
+
+def process_message(topic, msg, time_sec, state, frame_id, output_dirs):
+    if "radar" in topic:
+        handle_radar_message(
+            topic, msg, time_sec, state["radar_window"], state["radar_counts"]
+        )
+    elif vehicle_odom_pattern.match(topic):
+        handle_opponent_odometry(topic, msg, time_sec, state["opponent_history"])
     elif "/vehicle/uva_odometry" in topic:
-        ego_time = time_sec
-        trim_radar_window(radar_window, ego_time, RADAR_WINDOW_DURATION, radar_counts)
-
-        if not (radar_counts.get("front", 0) or radar_counts.get("rear", 0)):
-            return frame_id
-
-        synced_opponents = sync_opponents_to_ego(opponent_history, ego_time)
-        if radar_window and synced_opponents:
-            bounding_boxes = preprocess_bounding_boxes(msg.pose.pose, synced_opponents)
-
-            radar_grid, points = preprocess_input(
-                msg.pose.pose, synced_opponents, radar_window, bounding_boxes
-            )
-
-            ego_velocity = np.array(
-                [msg.twist.twist.linear.x, msg.twist.twist.linear.y]
-            )
-
-            velocities = preprocess_velocities(
-                msg.pose.pose.orientation, ego_velocity, synced_opponents
-            )
-
-            save_frame_data(
-                frame_id, bounding_boxes, radar_grid, points, velocities, output_dirs
-            )
-
-            frame_id += 1
-
+        frame_id = handle_ego_odometry(
+            msg,
+            time_sec,
+            state["radar_window"],
+            state["radar_counts"],
+            state["opponent_history"],
+            frame_id,
+            output_dirs,
+        )
     return frame_id
 
 
@@ -196,30 +180,22 @@ def main():
         "bbox": os.path.join(args.dataset, "bounding_box_labels"),
         "velocity": os.path.join(args.dataset, "velocity"),
     }
-
     shutil.rmtree(args.dataset, ignore_errors=True)
     for directory in output_dirs.values():
         os.makedirs(directory)
 
     reader = RosBagReader(args.mcap_dir, args.topics)
 
-    radar_window = deque()
-    radar_counts = defaultdict(int)
-    opponent_history = defaultdict(deque)
+    state = {
+        "radar_window": deque(),
+        "radar_counts": defaultdict(int),
+        "opponent_history": {},
+    }
 
     frame_id = 0
     for topic, msg, timestamp in tqdm(reader.read_messages()):
         time_sec = timestamp * 1e-9
-        frame_id = process_message(
-            topic,
-            msg,
-            time_sec,
-            radar_window,
-            radar_counts,
-            opponent_history,
-            frame_id,
-            output_dirs,
-        )
+        frame_id = process_message(topic, msg, time_sec, state, frame_id, output_dirs)
 
 
 if __name__ == "__main__":

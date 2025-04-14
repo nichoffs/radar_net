@@ -1,3 +1,5 @@
+from math import atan2, cos, sin
+
 import cv2
 import numpy as np
 
@@ -16,6 +18,40 @@ SENSOR_POSITIONS = {
 GRID_SIZE = 800
 METER_RANGE = 200
 PIXEL_RESOLUTION = METER_RANGE / GRID_SIZE
+
+LENGTH = 4.91
+WIDTH = 1.905
+
+VEHICLE_CORNERS = np.array(
+    [
+        [LENGTH / 2, WIDTH / 2],
+        [LENGTH / 2, -WIDTH / 2],
+        [-LENGTH / 2, -WIDTH / 2],
+        [-LENGTH / 2, WIDTH / 2],
+    ]
+)
+
+
+def compute_relative_translation(ego_pose, opp_pose, ego_yaw):
+    dx_global = opp_pose.position.x - ego_pose.position.x
+    dy_global = opp_pose.position.y - ego_pose.position.y
+    dx_rel = dx_global * cos(ego_yaw) + dy_global * sin(ego_yaw)
+    dy_rel = -dx_global * sin(ego_yaw) + dy_global * cos(ego_yaw)
+    return dx_rel, dy_rel
+
+
+def create_transformation_matrix(rel_yaw, translation):
+    tx, ty = translation
+    return np.array(
+        [[cos(rel_yaw), -sin(rel_yaw), tx], [sin(rel_yaw), cos(rel_yaw), ty], [0, 0, 1]]
+    )
+
+
+def transform_corners(transform, corners):
+    num_corners = corners.shape[0]
+    corners_homogeneous = np.hstack([corners, np.ones((num_corners, 1))])
+    transformed = (transform @ corners_homogeneous.T).T
+    return transformed[:, :2]
 
 
 def normalize_field(raw_values, norm_min, norm_max, raw_max=65535.0):
@@ -158,16 +194,52 @@ def get_points_in_bboxes(vehicle_boxes, normalized_detections):
     return result
 
 
-def preprocess_input(ego_odom, opponent_odoms, radar_window, bounding_boxes=None):
+def compute_relative_velocity(ego_yaw, ego_velocity, opp_velocity):
+    v_rel_map = opp_velocity - ego_velocity
+    R_map_to_ego = np.array(
+        [[cos(-ego_yaw), -sin(-ego_yaw)], [sin(-ego_yaw), cos(-ego_yaw)]]
+    )
+    v_rel_ego = R_map_to_ego @ v_rel_map
+    return v_rel_ego
+
+
+def yaw_from_quaternion(q):
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return atan2(siny_cosp, cosy_cosp)
+
+
+def preprocess_per_vehicle(ego_pose, ego_velocity, synced_opponents, radar_window):
+    ego_yaw = yaw_from_quaternion(ego_pose.orientation)
+
     normalized_detections = normalize_radar_detections(radar_window)
     radar_grid = map_points_to_grid(normalized_detections)
-    points_in_boxes = None
-    if bounding_boxes:
-        close_boxes = [
-            (vid, box)
-            for (vid, box) in bounding_boxes
-            if np.any(np.linalg.norm(box, axis=-1) < 100)
-        ]
-        if close_boxes:
-            points_in_boxes = get_points_in_bboxes(close_boxes, normalized_detections)
-    return radar_grid, points_in_boxes
+
+    vehicle_data = {}
+
+    for vehicle_id, (opp_pose, vx, vy) in synced_opponents.items():
+        opp_yaw = yaw_from_quaternion(opp_pose.orientation)
+        rel_yaw = opp_yaw - ego_yaw
+        translation = compute_relative_translation(ego_pose, opp_pose, ego_yaw)
+        transform = create_transformation_matrix(rel_yaw, translation)
+        box = transform_corners(transform, VEHICLE_CORNERS)
+
+        if not np.any(np.linalg.norm(box, axis=-1) < 100):
+            continue
+
+        opp_velocity = np.array([vx, vy])
+        rel_velocity = compute_relative_velocity(ego_yaw, ego_velocity, opp_velocity)
+
+        points = []
+        for detection in normalized_detections:
+            if point_in_polygon(tuple(detection[3:5]), box):
+                points.append(detection[:3])
+
+        if points:
+            vehicle_data[vehicle_id] = {
+                "box": box,
+                "velocity": rel_velocity,
+                "points": np.array(points, dtype=np.float32),
+            }
+
+    return radar_grid, vehicle_data
