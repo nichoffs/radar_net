@@ -15,14 +15,6 @@ class RosBagReader:
         storage_id: str = "mcap",
         start_offset: int = 0,
     ):
-        """
-        Initializes the RosBagReader.
-
-        Args:
-            input_bag: Path to the ROS bag file.
-            topic_names: List of topic names to read.
-            storage_id: Storage identifier (default is "mcap").
-        """
         self.reader = rosbag2_py.SequentialReader()
         self.reader.open(
             rosbag2_py.StorageOptions(uri=input_bag, storage_id=storage_id),
